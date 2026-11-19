@@ -11,6 +11,7 @@ Uso:
 import argparse
 import os
 import sys
+import traceback
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -20,6 +21,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from pymysql.converters import escape_item
+
+from correo import enviar_solicitud
 
 TZ_MX = ZoneInfo("America/Mexico_City")
 
@@ -106,6 +109,7 @@ def generar_sql(columnas, filas, departamentos: dict, ruta: str, dia: date):
     """Escribe un script con un UPDATE por item. Devuelve (actualizables, sin_departamento)."""
     i_id = columnas.index("IDItemRemision")
     i_sku = columnas.index("material_sku")
+    i_orden = columnas.index("order_number")
 
     actualizables, sin_departamento = [], []
     for fila in filas:
@@ -113,7 +117,7 @@ def generar_sql(columnas, filas, departamentos: dict, ruta: str, dia: date):
         if id_item is None:
             continue
         depto = departamentos.get(sku)
-        (actualizables if depto is not None else sin_departamento).append((id_item, sku, depto))
+        (actualizables if depto is not None else sin_departamento).append((id_item, sku, depto, fila[i_orden]))
 
     q = lambda v: escape_item(v, "utf8mb4")
     comentario = lambda v: str(v).replace("\n", " ").replace("\r", " ")
@@ -125,7 +129,7 @@ def generar_sql(columnas, filas, departamentos: dict, ruta: str, dia: date):
         f.write(f"-- Items a actualizar: {len(actualizables)}\n")
         f.write(f"-- Items sin departamento encontrado: {len(sin_departamento)}\n\n")
         f.write("START TRANSACTION;\n\n")
-        for id_item, sku, depto in actualizables:
+        for id_item, sku, depto, _ in actualizables:
             # La condición extra evita sobrescribir un item que alguien ya corrigió.
             f.write(
                 f"UPDATE ItemRemision SET fk_department = {q(depto)} "
@@ -137,7 +141,7 @@ def generar_sql(columnas, filas, departamentos: dict, ruta: str, dia: date):
         f.write("-- COMMIT;\n")
         if sin_departamento:
             f.write("\n-- Items sin departamento en ningún otro registro con el mismo SKU (no se actualizan):\n")
-            for id_item, sku, _ in sin_departamento:
+            for id_item, sku, _, _ in sin_departamento:
                 f.write(f"--   IDItemRemision {id_item}, SKU {comentario(sku)}\n")
 
     return actualizables, sin_departamento
@@ -198,6 +202,7 @@ def main():
     parser.add_argument("--fecha", help="Día a consultar YYYY-MM-DD (por defecto: ayer en CDMX)")
     parser.add_argument("--salida", help="Ruta del archivo Excel de salida")
     parser.add_argument("--sql", help="Ruta del script SQL de actualización")
+    parser.add_argument("--sin-correo", action="store_true", help="No enviar el correo con los scripts")
     args = parser.parse_args()
 
     if args.fecha:
@@ -218,6 +223,7 @@ def main():
         finally:
             conn.close()
     except pymysql.MySQLError as e:
+        traceback.print_exc()
         sys.exit(f"Error de base de datos: {e}")
 
     generar_excel(columnas, filas, departamentos, salida, dia)
@@ -225,6 +231,19 @@ def main():
 
     print(f"Excel: {len(filas)} registros -> {os.path.abspath(salida)}")
     print(f"SQL:   {len(actualizables)} UPDATE, {len(sin_depto)} sin departamento -> {os.path.abspath(salida_sql)}")
+
+    if args.sin_correo:
+        print("Correo: omitido (--sin-correo).")
+    elif not actualizables:
+        print("Correo: no se envía porque no hay registros que actualizar.")
+    else:
+        remisiones = sorted({str(a[3]) for a in actualizables if a[3] is not None})
+        try:
+            destinatarios = enviar_solicitud(salida_sql, salida, remisiones, dia)
+        except Exception as e:  # el Excel y el SQL ya quedaron generados
+            traceback.print_exc()
+            sys.exit(f"Error al enviar el correo: {e}")
+        print(f"Correo enviado a: {', '.join(destinatarios)}")
 
 
 if __name__ == "__main__":
